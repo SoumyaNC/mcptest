@@ -8,8 +8,15 @@ Run with: py client.py
 """
 
 import asyncio
+import os
+import sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+_VENV_PYTHON = os.path.join(_PROJECT_DIR, ".venv", "Scripts", "python.exe")
+SERVER_PYTHON = _VENV_PYTHON if os.path.exists(_VENV_PYTHON) else sys.executable
+SERVER_SCRIPT = os.path.join(_PROJECT_DIR, "server.py")
 
 
 async def print_result(label, session, tool_name, args=None):
@@ -25,8 +32,8 @@ async def print_result(label, session, tool_name, args=None):
 
 async def main():
     server_params = StdioServerParameters(
-        command=r"F:\Python\mcptest\.venv\Scripts\python.exe",
-        args=["server.py"],
+        command=SERVER_PYTHON,
+        args=[SERVER_SCRIPT],
     )
 
     async with stdio_client(server_params) as (read, write):

@@ -34,8 +34,27 @@ print(f"Deployment: {AZURE_DEPLOYMENT!r}")
 print(f"API version: {AZURE_API_VERSION!r}")
 print("==================================")
 
-SERVER_PYTHON = r"F:\Python\mcptest\.venv\Scripts\python.exe"
-SERVER_SCRIPT = "server.py"
+import sys
+
+# Compute the venv's python.exe relative to this script's location, so this
+# works on any machine without hardcoding a specific drive/folder path.
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+_VENV_PYTHON = os.path.join(_PROJECT_DIR, ".venv", "Scripts", "python.exe")
+
+if os.path.exists(_VENV_PYTHON):
+    SERVER_PYTHON = _VENV_PYTHON
+else:
+    # Fall back to whatever Python is currently running this Streamlit app
+    # (e.g. if there's no .venv folder, or it's named differently here).
+    SERVER_PYTHON = sys.executable
+
+SERVER_SCRIPT = os.path.join(_PROJECT_DIR, "server.py")
+
+print("=== Subprocess launch config ===")
+print(f"Project dir: {_PROJECT_DIR}")
+print(f"Server python: {SERVER_PYTHON} (exists: {os.path.exists(SERVER_PYTHON)})")
+print(f"Server script: {SERVER_SCRIPT} (exists: {os.path.exists(SERVER_SCRIPT)})")
+print("=================================")
 
 SYSTEM_PROMPT = """You are a database architecture documentation generator.
 
