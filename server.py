@@ -20,15 +20,24 @@ load_dotenv(dotenv_path=_ENV_PATH)
 # ---- Connection settings (hardcoded server/db for this test; we'll make
 # this dynamic later when the tool needs to support "any" database).
 # Credentials come from .env file, not hardcoded in source. ----
-SERVER = r"localhost\SQLEXPRESS"
-DATABASE = "test"
-SQL_USER = os.environ.get("MCPTEST_SQL_USER", "mcptest_user")
+SERVER = os.environ.get("MCPTEST_SQL_SERVER")
+DATABASE = os.environ.get("MCPTEST_SQL_DATABASE")
+SQL_USER = os.environ.get("MCPTEST_SQL_USER")
 SQL_PASSWORD = os.environ.get("MCPTEST_SQL_PASSWORD")
 
-if not SQL_PASSWORD:
+missing = [
+    name for name, value in [
+        ("MCPTEST_SQL_SERVER", SERVER),
+        ("MCPTEST_SQL_DATABASE", DATABASE),
+        ("MCPTEST_SQL_USER", SQL_USER),
+        ("MCPTEST_SQL_PASSWORD", SQL_PASSWORD),
+    ]
+    if not value
+]
+if missing:
     raise RuntimeError(
-        f"MCPTEST_SQL_PASSWORD not found. Looked for .env at: {_ENV_PATH}. "
-        f"Make sure that file exists and contains MCPTEST_SQL_PASSWORD=..."
+        f"Missing required environment variables for SQL Server connection: {', '.join(missing)}. "
+        f"Looked for .env at: {_ENV_PATH}."
     )
 
 CONN_STR = (
