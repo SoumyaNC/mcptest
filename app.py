@@ -14,25 +14,27 @@ import json
 import os
 
 import streamlit as st
-from dotenv import load_dotenv
-from openai import AzureOpenAI
+from dotenv import load_dotenv, dotenv_values, set_key
+from copilot import CopilotClient
+from copilot.session import PermissionHandler
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+import sys
 
-AZURE_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
-AZURE_API_KEY = os.environ.get("AZURE_OPENAI_API_KEY", "")
-AZURE_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
-AZURE_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
+# Project and config paths used for loading and saving connection settings.
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ENV_PATH = os.path.join(_PROJECT_DIR, ".env")
+if not os.path.exists(_ENV_PATH):
+    open(_ENV_PATH, "a", encoding="utf-8").close()
+load_dotenv(dotenv_path=_ENV_PATH)
 
-print("=== Azure OpenAI config check ===")
-print(f"Endpoint set: {bool(AZURE_ENDPOINT)} -> {AZURE_ENDPOINT}")
-print(f"API key set: {bool(AZURE_API_KEY)} (length: {len(AZURE_API_KEY)})")
-print(f"Deployment: {AZURE_DEPLOYMENT!r}")
-print(f"API version: {AZURE_API_VERSION!r}")
-print("==================================")
+COPILOT_MODEL = os.environ.get("COPILOT_MODEL", "gpt-5-mini")
+
+print("=== Copilot SDK config check ===")
+print(f"Model: {COPILOT_MODEL!r}")
+print("=================================")
 
 import sys
 
@@ -97,7 +99,7 @@ Markdown document as your last message -- no commentary before or after.
 
 async def fetch_schema():
     """Connect to the MCP server once and pull all object lists."""
-    server_params = StdioServerParameters(command=SERVER_PYTHON, args=[SERVER_SCRIPT])
+    server_params = StdioServerParameters(command=SERVER_PYTHON, args=[SERVER_SCRIPT], env=get_mcp_env())
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -122,76 +124,34 @@ async def fetch_schema():
 
 
 async def generate_doc(selected_objects: dict):
-    """Run the agentic loop, but scoped only to the selected objects."""
-    server_params = StdioServerParameters(command=SERVER_PYTHON, args=[SERVER_SCRIPT])
-
-    client = AzureOpenAI(
-        azure_endpoint=AZURE_ENDPOINT,
-        api_key=AZURE_API_KEY,
-        api_version=AZURE_API_VERSION,
+    """
+    Use the Copilot SDK to generate the doc. The SDK connects to our
+    MCP server directly (as a local/stdio server) and handles tool
+    discovery + the call loop internally -- we just send one prompt.
+    """
+    selected_summary = json.dumps(selected_objects, indent=2)
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Document exactly these selected objects:\n{selected_summary}"
     )
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-
-            mcp_tools = await session.list_tools()
-            openai_tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description or "",
-                        "parameters": t.inputSchema or {"type": "object", "properties": {}},
-                    },
-                }
-                for t in mcp_tools.tools
-            ]
-
-            selected_summary = json.dumps(selected_objects, indent=2)
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"Document exactly these selected objects:\n{selected_summary}",
+    async with CopilotClient() as client:
+        session = await client.create_session(
+            on_permission_request=PermissionHandler.approve_all,
+            model=COPILOT_MODEL,
+            mcp_servers={
+                "sql-schema-explorer": {
+                    "type": "local",
+                    "command": SERVER_PYTHON,
+                    "args": [SERVER_SCRIPT],
+                    "env": get_mcp_env(),
+                    "tools": ["*"],
                 },
-            ]
-
-            max_turns = 25
-            for _ in range(max_turns):
-                response = client.chat.completions.create(
-                    model=AZURE_DEPLOYMENT,
-                    messages=messages,
-                    tools=openai_tools,
-                    tool_choice="auto",
-                )
-                choice = response.choices[0]
-                messages.append(choice.message.model_dump(exclude_none=True))
-
-                if choice.message.tool_calls:
-                    for tool_call in choice.message.tool_calls:
-                        tool_name = tool_call.function.name
-                        try:
-                            tool_args = json.loads(tool_call.function.arguments or "{}")
-                        except json.JSONDecodeError:
-                            tool_args = {}
-                        result = await session.call_tool(tool_name, tool_args)
-                        if result.content:
-                            result_text = "\n".join(
-                                item.text for item in result.content if hasattr(item, "text")
-                            )
-                        else:
-                            result_text = "(empty result)"
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": result_text,
-                        })
-                    continue
-                else:
-                    return choice.message.content or "(no content returned)"
-
-            return "Reached max turns without a final answer."
+            },
+        )
+        async with session:
+            response = await session.send_and_wait(prompt)
+            return response.data.content if response and response.data else "(no content returned)"
 
 
 def run_async(coro):
@@ -207,12 +167,119 @@ def loading_banner(placeholder, text):
     )
 
 
+def is_connection_ready():
+    info = st.session_state.connection_info
+    return bool(info.get("server") and info.get("database") and info.get("user") and info.get("password"))
+
+
+def get_mcp_env():
+    env = os.environ.copy()
+    info = st.session_state.connection_info
+    env.update({
+        "MCPTEST_SQL_SERVER": info["server"],
+        "MCPTEST_SQL_DATABASE": info["database"],
+        "MCPTEST_SQL_USER": info["user"],
+        "MCPTEST_SQL_PASSWORD": info["password"],
+    })
+    return env
+
+
+def save_connection_to_env(connection_info: dict):
+    """Persist the current connection values to the .env file and process env."""
+    set_key(_ENV_PATH, "MCPTEST_SQL_SERVER", connection_info["server"])
+    set_key(_ENV_PATH, "MCPTEST_SQL_DATABASE", connection_info["database"])
+    set_key(_ENV_PATH, "MCPTEST_SQL_USER", connection_info["user"])
+    set_key(_ENV_PATH, "MCPTEST_SQL_PASSWORD", connection_info["password"])
+    # Keep the running process env in sync too.
+    os.environ["MCPTEST_SQL_SERVER"] = connection_info["server"]
+    os.environ["MCPTEST_SQL_DATABASE"] = connection_info["database"]
+    os.environ["MCPTEST_SQL_USER"] = connection_info["user"]
+    os.environ["MCPTEST_SQL_PASSWORD"] = connection_info["password"]
+
+
+def load_connection_from_env():
+    """Load connection settings from .env or current environment."""
+    values = dotenv_values(_ENV_PATH)
+    return {
+        "server": values.get("MCPTEST_SQL_SERVER") or os.environ.get("MCPTEST_SQL_SERVER", ""),
+        "database": values.get("MCPTEST_SQL_DATABASE") or os.environ.get("MCPTEST_SQL_DATABASE", ""),
+        "user": values.get("MCPTEST_SQL_USER") or os.environ.get("MCPTEST_SQL_USER", ""),
+        "password": values.get("MCPTEST_SQL_PASSWORD") or os.environ.get("MCPTEST_SQL_PASSWORD", ""),
+    }
+
+
+def initialize_connection_form():
+    if "conn_server" not in st.session_state:
+        if st.session_state.connection_confirmed:
+            st.session_state.conn_server = st.session_state.connection_info.get("server", "")
+            st.session_state.conn_database = st.session_state.connection_info.get("database", "")
+            st.session_state.conn_user = st.session_state.connection_info.get("user", "")
+            st.session_state.conn_password = st.session_state.connection_info.get("password", "")
+        else:
+            st.session_state.conn_server = ""
+            st.session_state.conn_database = ""
+            st.session_state.conn_user = ""
+            st.session_state.conn_password = ""
+
+
+def reset_connection_form():
+    for field in ["conn_server", "conn_database", "conn_user", "conn_password"]:
+        if field in st.session_state:
+            del st.session_state[field]
+
+
+def show_connection_dialog():
+    container = st.container()
+    with container:
+        st.markdown("### Connect to SQL Server")
+        st.markdown("Fill in the SQL Server connection details below to continue.")
+
+        initialize_connection_form()
+
+        with st.form("connection_form"):
+            st.text_input("Server", key="conn_server")
+            st.text_input("Database", key="conn_database")
+            st.text_input("Username", key="conn_user")
+            st.text_input("Password", type="password", key="conn_password")
+            save = st.form_submit_button("Save Connection")
+
+        if save:
+            new_info = {
+                "server": st.session_state.get("conn_server", ""),
+                "database": st.session_state.get("conn_database", ""),
+                "user": st.session_state.get("conn_user", ""),
+                "password": st.session_state.get("conn_password", ""),
+            }
+            st.session_state.connection_info = new_info
+            save_connection_to_env(new_info)
+            st.session_state.connection_confirmed = True
+            st.session_state.editing_connection = False
+            reset_connection_form()
+
+
 # ---------------------------- Streamlit UI ----------------------------
 
 import streamlit.components.v1 as components
 from streamlit_tree_select import tree_select
 
 st.set_page_config(page_title="DB Architecture Doc Generator", layout="centered")
+
+if "connection_info" not in st.session_state:
+    st.session_state.connection_info = {
+        "server": os.environ.get("MCPTEST_SQL_SERVER", r"localhost\SQLEXPRESS"),
+        "database": os.environ.get("MCPTEST_SQL_DATABASE", "test"),
+        "user": os.environ.get("MCPTEST_SQL_USER", "mcptest_user"),
+        "password": os.environ.get("MCPTEST_SQL_PASSWORD", ""),
+    }
+if "editing_connection" not in st.session_state:
+    st.session_state.editing_connection = False
+if "connection_confirmed" not in st.session_state:
+    st.session_state.connection_confirmed = False
+
+if not st.session_state.connection_confirmed:
+    st.session_state.editing_connection = True
+    show_connection_dialog()
+    st.stop()
 
 # ---- SSMS-style theming (light/classic: white background, blue accents,
 # grid-like panels, Segoe UI font to match Windows/SSMS look) ----
@@ -387,20 +454,32 @@ if "generated_doc" not in st.session_state:
 st.markdown('<div class="ssms-panel">', unsafe_allow_html=True)
 st.markdown('<div class="ssms-panel-title">Step 1 &middot; Connect &amp; Load Schema</div>', unsafe_allow_html=True)
 
-if st.button("Load Database Schema"):
-    loading_slot = st.empty()
-    loading_banner(loading_slot, "Connecting via MCP and fetching schema&hellip;")
-    try:
-        st.session_state.schema = run_async(fetch_schema())
-        loading_slot.empty()
-        st.markdown('<span class="ssms-statusbar">Connected &mdash; schema loaded successfully</span>', unsafe_allow_html=True)
-    except Exception as e:
-        loading_slot.empty()
-        st.error(f"Failed to load schema: {e}")
+conn = st.session_state.connection_info
+st.markdown(f"**Connection target:** `{conn['server']}` / `{conn['database']}` / `{conn['user']}`", unsafe_allow_html=True)
+if st.button("Edit Connection"):
+    st.session_state.editing_connection = True
+
+if st.button("Test Connection"):
+    if not is_connection_ready():
+        st.error("Please fill in server, database, username, and password before testing connection.")
+    else:
+        loading_slot = st.empty()
+        loading_banner(loading_slot, "Testing connection to SQL Server…")
+        try:
+            st.session_state.schema = run_async(fetch_schema())
+            loading_slot.empty()
+            st.markdown('<span class="ssms-statusbar">Connected — schema loaded successfully</span>', unsafe_allow_html=True)
+        except Exception as e:
+            loading_slot.empty()
+            st.error(f"Failed to load schema: {e}")
 
 st.markdown('</div>', unsafe_allow_html=True)
 
 selected = {"tables": [], "views": [], "stored_procedures": [], "functions": []}
+
+if st.session_state.editing_connection:
+    show_connection_dialog()
+    st.stop()
 
 if st.session_state.schema:
     schema = st.session_state.schema
